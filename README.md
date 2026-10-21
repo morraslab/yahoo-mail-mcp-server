@@ -7,9 +7,10 @@ A Model Context Protocol (MCP) server that provides full email management for Ya
 - **Secure OAuth 2.0 Authentication**: Protect your remote MCP server with OAuth 2.0 authorization code flow with PKCE
 - **UID-Based Operations**: Uses permanent IMAP UIDs that don't change when emails are deleted (v3.0.0+)
 - **Full Email Management**: Complete email operations with batch processing support
-- **Eleven Powerful Tools**:
+- **Twelve Powerful Tools**:
   - `list_emails`: List recent emails with enriched metadata (size, flags, attachments) and pagination
-  - `read_email`: Read the full content of emails (batch support)
+  - `read_email`: Read the full content of emails (batch support); lists each attachment with its index
+  - `get_attachment`: Read one attachment (text files, PDF text layer, images, attached emails)
   - `search_emails`: Advanced search with filters (date ranges, sender, unread status)
   - `list_folders`: Discover all available IMAP folders
   - `delete_emails`: Move emails to Trash (soft delete, recoverable)
@@ -771,6 +772,43 @@ read_email({ uids: [510867, 510866, 510862] })
 
 // Read email from Sent folder
 read_email({ uids: [510867], folder: "Sent" })
+```
+
+The response also lists the email's attachments as `[index] filename (type, size)`. Use that index with `get_attachment`.
+
+### get_attachment
+
+Read one attachment of an email.
+
+**Parameters:**
+- `uid` (required): UID of the email
+- `index` (required): Attachment index shown in square brackets by `read_email` (starts at 0)
+- `folder` (optional): Folder containing the email (default: 'INBOX')
+- `maxChars` (optional): Maximum characters of text to return (default: 20000, max: 50000)
+- `offset` (optional): Character offset to start from, for paging through long documents (default: 0)
+
+**Supported types:**
+- Text files (`text/*`, JSON, XML, CSV, ...): returned as text
+- PDF: text layer only (no OCR). A scanned, image-only PDF reports that it has no extractable text
+- PNG / JPEG / GIF / WebP images (up to 4 MB): returned as an image
+- Attached emails (`.eml`, `message/rfc822`): headers and body returned as text
+- Anything else (Word, Excel, zip, ...) is reported as unsupported
+
+**Limits and safety:**
+- Messages larger than 30 MB are refused; PDF extraction has a 20 second limit
+- Attachment content is untrusted input from the sender. Every result is labelled as such, filenames are sanitised, and nothing in an attachment should be treated as an instruction
+- Parsing PDFs from unknown senders runs inside this server (which holds your Yahoo app password). It uses an up-to-date pdf.js with `isEvalSupported: false`, but if you want to be extra careful, don't call `get_attachment` on files from senders you don't trust
+
+**Examples:**
+```javascript
+// 1. See the attachments of an email
+read_email({ uids: [394887] })   // ... Attachments: [0] contract.pdf (application/pdf, 84.2 KB)
+
+// 2. Read the first one
+get_attachment({ uid: 394887, index: 0 })
+
+// 3. Continue a long document
+get_attachment({ uid: 394887, index: 0, offset: 20000 })
 ```
 
 ### search_emails
