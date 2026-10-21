@@ -477,6 +477,7 @@ docker ps
 | `YAHOO_APP_PASSWORD` | Yes | - | 16-character app-specific password from Yahoo |
 | `OAUTH_CLIENT_ID` | Yes (Remote) | - | OAuth 2.0 client ID for MCP server authentication (generate with `openssl rand -hex 16`) |
 | `OAUTH_CLIENT_SECRET` | Yes (Remote) | - | OAuth 2.0 client secret for MCP server authentication (generate with `openssl rand -hex 32`) |
+| `OAUTH_ALLOWED_REDIRECT_URIS` | No | Claude's callbacks | Comma-separated exact redirect URIs allowed to receive authorization codes. Defaults to `https://claude.ai/api/mcp/auth_callback` and `https://claude.com/api/mcp/auth_callback` |
 | `TRANSPORT_MODE` | No | `stdio` | Transport mode: `stdio` or `sse` |
 | `PORT` | No | `3000` | Port for SSE mode (auto-set by Render) |
 | `NODE_ENV` | No | `development` | Environment: `development` or `production` |
@@ -519,8 +520,10 @@ yahoo-mail-mcp-server/
 ## Security Best Practices
 
 1. **OAuth 2.0 Protection** (Remote Deployments)
-   - Server requires OAuth 2.0 authentication for all MCP requests
-   - Uses authorization code flow with PKCE (Proof Key for Code Exchange)
+   - Server requires OAuth 2.0 authentication for all MCP requests, and **refuses to start in SSE mode if `OAUTH_CLIENT_ID` / `OAUTH_CLIENT_SECRET` are missing** (it never runs unauthenticated)
+   - Uses authorization code flow with PKCE (S256 is mandatory)
+   - Redirect URIs are matched exactly against an allowlist (see `OAUTH_ALLOWED_REDIRECT_URIS`)
+   - Access tokens and authorization codes are random, expire (1 hour / 60 seconds) and codes are single-use; they live in memory, so a restart means the client re-authorizes
    - Only clients with correct credentials can access your emails
    - Generate strong random credentials: `openssl rand -hex 16` and `openssl rand -hex 32`
    - Store credentials securely in Render dashboard (marked as "Secret")
@@ -627,10 +630,7 @@ When running in SSE mode, the server exposes these endpoints:
 
 ```json
 {
-  "status": "ok",
-  "service": "yahoo-mail-mcp",
-  "version": "1.0.0",
-  "timestamp": "2025-01-11T12:34:56.789Z"
+  "status": "ok"
 }
 ```
 
