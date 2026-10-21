@@ -2,9 +2,12 @@
 
 /**
  * Yahoo Mail MCP Server with OAuth2 - A beginner-friendly introduction to MCP
- * This server provides read-only access to Yahoo Mail via OAuth2 and IMAP
+ * This server provides access to Yahoo Mail via IMAP (read, search, flag, move,
+ * archive and soft-delete to Trash; it cannot send mail). In SSE mode it is
+ * protected by OAuth2 (authorization code + PKCE).
  */
 
+import crypto from 'node:crypto';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
@@ -15,12 +18,62 @@ import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 
-// Load environment variables from .env file (for local development)
-dotenv.config();
+// Load environment variables from .env file (for local development).
+// quiet: dotenv v17 otherwise prints a banner to stdout, which corrupts the MCP stdio stream.
+dotenv.config({ quiet: true });
+
+// OAuth lifetimes
+const ACCESS_TOKEN_TTL_MS = 60 * 60 * 1000; // 1 hour (matches expires_in below)
+const AUTH_CODE_TTL_MS = 60 * 1000;         // 60 seconds
+
+// Redirect URIs that may receive authorization codes. Exact match only.
+// Override with OAUTH_ALLOWED_REDIRECT_URIS (comma-separated) if your client uses another callback.
+const DEFAULT_ALLOWED_REDIRECT_URIS = [
+    'https://claude.ai/api/mcp/auth_callback',
+    'https://claude.com/api/mcp/auth_callback'
+];
+const ALLOWED_REDIRECT_URIS = new Set(
+    (process.env.OAUTH_ALLOWED_REDIRECT_URIS
+        ? process.env.OAUTH_ALLOWED_REDIRECT_URIS.split(',').map(s => s.trim()).filter(Boolean)
+        : DEFAULT_ALLOWED_REDIRECT_URIS)
+);
+
+/** Generate an unguessable URL-safe random string. */
+const randomToken = (bytes = 32) => crypto.randomBytes(bytes).toString('base64url');
+
+/** Constant-time string comparison (hashes first so lengths never leak). */
+const safeEqual = (a, b) => {
+    if (typeof a !== 'string' || typeof b !== 'string') return false;
+    const ha = crypto.createHash('sha256').update(a).digest();
+    const hb = crypto.createHash('sha256').update(b).digest();
+    return crypto.timingSafeEqual(ha, hb);
+};
 
 class YahooMailMCPServer {
     constructor() {
-        this.server = new Server(
+        // Server instance used for stdio mode. In SSE mode every connection gets its own
+        // instance (see createServer), because the MCP SDK does not allow one Server to be
+        // shared between transports and doing so can leak data between clients.
+        this.server = this.createServer();
+
+        // Store active SSE transports (for routing messages)
+        this.transports = new Map();
+
+        // Valid OAuth access tokens -> expiry timestamp (in-memory, so a restart
+        // invalidates them and the client simply re-authorizes)
+        this.validTokens = new Map();
+
+        // Authorization codes for the OAuth authorization code flow -> details + expiry
+        this.authCodes = new Map();
+
+        this.setupErrorHandling();
+    }
+
+    /**
+     * Create a fully configured MCP Server instance (one per transport/connection)
+     */
+    createServer() {
+        const server = new Server(
             {
                 name: 'yahoo-mail-mcp',
                 version: '3.0.0',
@@ -32,27 +85,20 @@ class YahooMailMCPServer {
             }
         );
 
-        // Store active SSE transports (for routing messages)
-        this.transports = new Map();
+        this.setupToolHandlers(server);
+        server.onerror = (error) => {
+            console.error('[MCP Error]', error);
+        };
 
-        // Store valid OAuth access tokens (in-memory)
-        // In production, use Redis or a database with TTL
-        this.validTokens = new Set();
-
-        // Store authorization codes for OAuth authorization code flow
-        // In production, use Redis with short TTL (60 seconds)
-        this.authCodes = new Map();
-
-        this.setupToolHandlers();
-        this.setupErrorHandling();
+        return server;
     }
 
     /**
-     * Setup MCP tool handlers
+     * Setup MCP tool handlers on the given server instance
      */
-    setupToolHandlers() {
+    setupToolHandlers(server) {
         // Handle tool listing
-        this.server.setRequestHandler(ListToolsRequestSchema, async () => {
+        server.setRequestHandler(ListToolsRequestSchema, async () => {
             return {
                 tools: [
                     {
@@ -309,7 +355,7 @@ class YahooMailMCPServer {
         });
 
         // Handle tool execution
-        this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
+        server.setRequestHandler(CallToolRequestSchema, async (request) => {
             const { name, arguments: args } = request.params;
 
             try {
@@ -536,12 +582,12 @@ class YahooMailMCPServer {
                 const emails = [];
 
                 fetch.on('message', (msg, seqno) => {
-                    let header = '';
+                    const headerChunks = [];
                     let attrs = null;
 
                     msg.on('body', (stream, info) => {
                         stream.on('data', (chunk) => {
-                            header += chunk.toString('ascii');
+                            headerChunks.push(chunk);
                         });
                     });
 
@@ -550,7 +596,7 @@ class YahooMailMCPServer {
                     });
 
                     msg.once('end', () => {
-                        const parsed = Imap.parseHeader(header);
+                        const parsed = Imap.parseHeader(Buffer.concat(headerChunks).toString('utf8'));
 
                         emails.push({
                             uid: attrs.uid,                          // NEW: Permanent UID
@@ -739,12 +785,12 @@ class YahooMailMCPServer {
                     const emails = [];
 
                     fetch.on('message', (msg, seqno) => {
-                        let header = '';
+                        const headerChunks = [];
                         let attrs = null;
 
                         msg.on('body', (stream, info) => {
                             stream.on('data', (chunk) => {
-                                header += chunk.toString('ascii');
+                                headerChunks.push(chunk);
                             });
                         });
 
@@ -753,7 +799,7 @@ class YahooMailMCPServer {
                         });
 
                         msg.once('end', () => {
-                            const parsed = Imap.parseHeader(header);
+                            const parsed = Imap.parseHeader(Buffer.concat(headerChunks).toString('utf8'));
                             emails.push({
                                 uid: attrs.uid,
                                 sequenceNumber: seqno,
@@ -937,14 +983,18 @@ class YahooMailMCPServer {
 
                 const emails = [];
                 const foundUIDs = new Set();
+                const parseFailures = [];
+                // simpleParser is asynchronous, so collect each parse promise and wait for
+                // all of them before answering (fetch 'end' fires before parsing finishes).
+                const parsePromises = [];
 
                 fetch.on('message', (msg, seqno) => {
-                    let buffer = '';
+                    const chunks = [];   // keep raw bytes; decoding is left to the MIME parser
                     let attrs = null;
 
                     msg.on('body', (stream, info) => {
                         stream.on('data', (chunk) => {
-                            buffer += chunk.toString('ascii');
+                            chunks.push(chunk);
                         });
                     });
 
@@ -954,25 +1004,28 @@ class YahooMailMCPServer {
                     });
 
                     msg.once('end', () => {
-                        simpleParser(buffer, (err, parsed) => {
-                            if (err) {
-                                console.error('Error parsing email:', err);
-                                return;
-                            }
-
-                            emails.push({
-                                uid: attrs.uid,
-                                sequenceNumber: seqno,  // Still include for reference
-                                from: parsed.from?.text || 'Unknown',
-                                to: parsed.to?.text || 'Unknown',
-                                subject: parsed.subject || 'No Subject',
-                                date: parsed.date || 'Unknown Date',
-                                size: attrs.size || 0,
-                                flags: attrs.flags || [],
-                                hasAttachments: this.hasAttachments(attrs.struct),
-                                content: parsed.text || parsed.html || 'No content available'
-                            });
-                        });
+                        const uid = attrs?.uid;
+                        parsePromises.push(
+                            simpleParser(Buffer.concat(chunks))
+                                .then((parsed) => {
+                                    emails.push({
+                                        uid: attrs.uid,
+                                        sequenceNumber: seqno,  // Still include for reference
+                                        from: parsed.from?.text || 'Unknown',
+                                        to: parsed.to?.text || 'Unknown',
+                                        subject: parsed.subject || 'No Subject',
+                                        date: parsed.date || 'Unknown Date',
+                                        size: attrs.size || 0,
+                                        flags: attrs.flags || [],
+                                        hasAttachments: this.hasAttachments(attrs.struct),
+                                        content: parsed.text || parsed.html || 'No content available'
+                                    });
+                                })
+                                .catch((parseErr) => {
+                                    console.error(`Error parsing email UID ${uid}:`, parseErr.message);
+                                    parseFailures.push(uid);
+                                })
+                        );
                     });
                 });
 
@@ -981,8 +1034,11 @@ class YahooMailMCPServer {
                     reject(err);
                 });
 
-                fetch.once('end', () => {
+                fetch.once('end', async () => {
                     imap.end();
+
+                    // Wait for every message to finish parsing
+                    await Promise.all(parsePromises);
 
                     // Check for missing UIDs
                     const missingUIDs = uids.filter(uid => !foundUIDs.has(uid));
@@ -999,7 +1055,7 @@ class YahooMailMCPServer {
                     emails.sort((a, b) => a.uid - b.uid);
 
                     // Format output
-                    const emailContent = emails.map(email =>
+                    let emailContent = emails.map(email =>
                         `📧 Email UID: ${email.uid} (Seq #${email.sequenceNumber})\n\n` +
                         `From: ${email.from}\n` +
                         `To: ${email.to}\n` +
@@ -1011,6 +1067,10 @@ class YahooMailMCPServer {
                         `--- Content ---\n` +
                         `${email.content}`
                     ).join('\n\n' + '='.repeat(80) + '\n\n');
+
+                    if (parseFailures.length > 0) {
+                        emailContent += `${emailContent ? '\n\n' : ''}Could not parse UID(s): ${parseFailures.join(', ')}`;
+                    }
 
                     resolve({
                         content: [{
@@ -1251,8 +1311,26 @@ class YahooMailMCPServer {
     }
 
     async runSSE() {
+        // Fail closed: never expose a mailbox over HTTP without OAuth credentials.
+        if (!process.env.OAUTH_CLIENT_ID || !process.env.OAUTH_CLIENT_SECRET) {
+            console.error('[Server] FATAL: OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET must be set in SSE mode. Refusing to start.');
+            process.exit(1);
+        }
+
         const app = express();
         const port = process.env.PORT || 3000;
+
+        // Periodically drop expired tokens and authorization codes
+        const pruneTimer = setInterval(() => {
+            const now = Date.now();
+            for (const [token, expiresAt] of this.validTokens) {
+                if (expiresAt <= now) this.validTokens.delete(token);
+            }
+            for (const [code, data] of this.authCodes) {
+                if (data.expires_at <= now) this.authCodes.delete(code);
+            }
+        }, 60 * 1000);
+        pruneTimer.unref();
 
         // Log startup configuration
         console.error('[Server] Starting in SSE mode');
@@ -1309,16 +1387,7 @@ class YahooMailMCPServer {
                 return next();
             }
 
-            // Check if OAuth is configured
-            const oauthConfigured = process.env.OAUTH_CLIENT_ID && process.env.OAUTH_CLIENT_SECRET;
-
-            if (!oauthConfigured) {
-                console.error('[Auth] WARNING: OAuth not configured - server is UNSECURED!');
-                console.error('[Auth] Set OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET to secure your server');
-                return next();
-            }
-
-            // Validate OAuth Bearer token
+            // Validate OAuth Bearer token (OAuth credentials are guaranteed to be set; see runSSE)
             const authHeader = req.headers.authorization;
             if (!authHeader || !authHeader.startsWith('Bearer ')) {
                 console.error('[Auth] Missing or invalid Authorization header');
@@ -1330,8 +1399,10 @@ class YahooMailMCPServer {
 
             const token = authHeader.substring(7); // Remove 'Bearer ' prefix
 
-            // Validate token (check if it's in our valid tokens set)
-            if (!this.validTokens || !this.validTokens.has(token)) {
+            // Validate token (must exist and not be expired)
+            const expiresAt = this.validTokens.get(token);
+            if (!expiresAt || expiresAt <= Date.now()) {
+                this.validTokens.delete(token);
                 console.error('[Auth] Invalid or expired access token');
                 return res.status(401).json({
                     error: 'invalid_token',
@@ -1416,7 +1487,7 @@ class YahooMailMCPServer {
             } = req.query;
 
             // Validate client_id
-            if (client_id !== clientId) {
+            if (!safeEqual(client_id, clientId)) {
                 console.error('[OAuth] Invalid client_id in authorize request');
                 return res.status(400).send('Invalid client_id');
             }
@@ -1427,24 +1498,30 @@ class YahooMailMCPServer {
                 return res.status(400).send('Unsupported response_type');
             }
 
-            // Validate redirect_uri (must be Claude's callback)
-            if (!redirect_uri || (!redirect_uri.includes('claude.ai') && !redirect_uri.includes('claude.com') && !redirect_uri.includes('localhost'))) {
-                console.error('[OAuth] Invalid redirect_uri:', redirect_uri);
+            // Validate redirect_uri: exact match against the allowlist (no substring matching)
+            if (typeof redirect_uri !== 'string' || !ALLOWED_REDIRECT_URIS.has(redirect_uri)) {
+                console.error('[OAuth] Rejected redirect_uri (not in allowlist):', redirect_uri);
+                console.error('[OAuth] If this is your Claude callback, add it to the OAUTH_ALLOWED_REDIRECT_URIS env var (comma-separated)');
                 return res.status(400).send('Invalid redirect_uri');
             }
 
-            // Generate authorization code
-            const authCode = Buffer.from(`${client_id}:${Date.now()}:${Math.random()}`).toString('base64');
+            // PKCE with S256 is mandatory
+            if (typeof code_challenge !== 'string' || !code_challenge || code_challenge_method !== 'S256') {
+                console.error('[OAuth] Missing or unsupported PKCE parameters');
+                return res.status(400).send('PKCE with code_challenge_method=S256 is required');
+            }
 
-            // Store auth code with PKCE challenge (in-memory - use Redis/DB in production)
-            if (!this.authCodes) this.authCodes = new Map();
+            // Generate an unguessable, short-lived, single-use authorization code
+            const authCode = randomToken(32);
+
             this.authCodes.set(authCode, {
                 client_id,
                 redirect_uri,
                 code_challenge,
                 code_challenge_method,
                 scope,
-                created_at: Date.now()
+                created_at: Date.now(),
+                expires_at: Date.now() + AUTH_CODE_TTL_MS
             });
 
             console.error('[OAuth] Authorization code generated, redirecting to:', redirect_uri);
@@ -1485,7 +1562,7 @@ class YahooMailMCPServer {
             }
 
             // Validate credentials
-            if (reqClientId !== clientId || reqClientSecret !== clientSecret) {
+            if (!safeEqual(reqClientId, clientId) || !safeEqual(reqClientSecret, clientSecret)) {
                 console.error('[OAuth] Authentication failed - invalid client credentials');
                 return res.status(401).json({
                     error: 'invalid_client',
@@ -1502,7 +1579,12 @@ class YahooMailMCPServer {
                 console.error('[OAuth] Authorization code grant - validating code');
 
                 // Validate authorization code
-                if (!this.authCodes || !this.authCodes.has(code)) {
+                const authData = typeof code === 'string' ? this.authCodes.get(code) : undefined;
+
+                // Single use: remove the code immediately, whatever happens next
+                if (authData) this.authCodes.delete(code);
+
+                if (!authData || authData.expires_at <= Date.now()) {
                     console.error('[OAuth] Invalid or expired authorization code');
                     return res.status(400).json({
                         error: 'invalid_grant',
@@ -1510,50 +1592,67 @@ class YahooMailMCPServer {
                     });
                 }
 
-                const authData = this.authCodes.get(code);
-
-                // Validate PKCE code verifier
-                if (authData.code_challenge) {
-                    const crypto = await import('crypto');
-                    const hash = crypto.createHash('sha256').update(code_verifier).digest('base64url');
-                    if (hash !== authData.code_challenge) {
-                        console.error('[OAuth] PKCE validation failed');
-                        return res.status(400).json({
-                            error: 'invalid_grant',
-                            error_description: 'PKCE validation failed'
-                        });
-                    }
+                // The code must belong to this client
+                if (!safeEqual(authData.client_id, reqClientId)) {
+                    console.error('[OAuth] Authorization code was issued to a different client');
+                    return res.status(400).json({
+                        error: 'invalid_grant',
+                        error_description: 'Authorization code was not issued to this client'
+                    });
                 }
 
-                // Delete used auth code (one-time use)
-                this.authCodes.delete(code);
+                // If the client repeats redirect_uri, it must match the one used at /authorize
+                if (redirect_uri !== undefined && redirect_uri !== authData.redirect_uri) {
+                    console.error('[OAuth] redirect_uri mismatch at token exchange');
+                    return res.status(400).json({
+                        error: 'invalid_grant',
+                        error_description: 'redirect_uri does not match the authorization request'
+                    });
+                }
 
-                // Generate access token
-                const accessToken = Buffer.from(`${reqClientId}:${Date.now()}:${Math.random()}`).toString('base64');
-                this.validTokens.add(accessToken);
+                // Validate PKCE code verifier (S256 is mandatory, enforced at /authorize)
+                if (typeof code_verifier !== 'string' || !code_verifier) {
+                    console.error('[OAuth] Missing code_verifier');
+                    return res.status(400).json({
+                        error: 'invalid_request',
+                        error_description: 'code_verifier is required'
+                    });
+                }
+                const hash = crypto.createHash('sha256').update(code_verifier).digest('base64url');
+                if (!safeEqual(hash, authData.code_challenge)) {
+                    console.error('[OAuth] PKCE validation failed');
+                    return res.status(400).json({
+                        error: 'invalid_grant',
+                        error_description: 'PKCE validation failed'
+                    });
+                }
+
+                // Generate access token (cryptographically random, with expiry)
+                const accessToken = randomToken(32);
+                this.validTokens.set(accessToken, Date.now() + ACCESS_TOKEN_TTL_MS);
 
                 console.error('[OAuth] Access token generated from authorization code');
 
                 return res.json({
                     access_token: accessToken,
                     token_type: 'Bearer',
-                    expires_in: 3600,
+                    expires_in: ACCESS_TOKEN_TTL_MS / 1000,
                     scope: authData.scope || 'mcp'
                 });
             }
 
             // Handle Client Credentials Grant
             if (grantType === 'client_credentials') {
-                // Generate access token
-                const accessToken = Buffer.from(`${clientId}:${Date.now()}:${Math.random()}`).toString('base64');
-                this.validTokens.add(accessToken);
+                // Generate access token (cryptographically random, with expiry)
+                const accessToken = randomToken(32);
+                this.validTokens.set(accessToken, Date.now() + ACCESS_TOKEN_TTL_MS);
 
                 console.error('[OAuth] Access token generated via client credentials');
 
                 return res.json({
                     access_token: accessToken,
                     token_type: 'Bearer',
-                    expires_in: 3600,
+                    expires_in: ACCESS_TOKEN_TTL_MS / 1000,
                     scope: 'mcp'
                 });
             }
@@ -1575,21 +1674,9 @@ class YahooMailMCPServer {
             });
         });
 
-        // Health check endpoint (enhanced with environment info)
+        // Health check endpoint (public, so it intentionally reveals nothing about the environment)
         app.get('/health', (req, res) => {
-            res.json({
-                status: 'ok',
-                service: 'yahoo-mail-mcp',
-                version: '3.0.0',
-                timestamp: new Date().toISOString(),
-                environment: {
-                    nodeVersion: process.version,
-                    platform: process.platform,
-                    emailConfigured: !!process.env.YAHOO_EMAIL,
-                    passwordConfigured: !!process.env.YAHOO_APP_PASSWORD,
-                    transportMode: process.env.TRANSPORT_MODE || 'stdio'
-                }
-            });
+            res.json({ status: 'ok' });
         });
 
         // SSE endpoint for MCP
@@ -1614,7 +1701,9 @@ class YahooMailMCPServer {
                     this.transports.delete(sessionId);
                 };
 
-                await this.server.connect(transport);
+                // A dedicated MCP server per connection (the SDK rejects sharing one between transports)
+                const mcpServer = this.createServer();
+                await mcpServer.connect(transport);
                 console.error('[SSE] MCP server connected to transport');
             } catch (error) {
                 console.error('[SSE] Error connecting transport:', error);
@@ -1661,30 +1750,9 @@ class YahooMailMCPServer {
             });
         });
 
-        // Root endpoint
+        // Root endpoint (public, so keep it minimal)
         app.get('/', (req, res) => {
-            res.json({
-                name: 'Yahoo Mail MCP Server',
-                version: '3.0.0',
-                description: 'MCP server for Yahoo Mail access via IMAP',
-                endpoints: {
-                    health: '/health',
-                    sse: '/mcp/sse',
-                    message: '/mcp/message'
-                },
-                tools: [
-                    'list_emails',
-                    'read_email',
-                    'search_emails',
-                    'delete_emails',
-                    'archive_emails',
-                    'mark_as_read',
-                    'mark_as_unread',
-                    'flag_emails',
-                    'unflag_emails',
-                    'move_emails'
-                ]
-            });
+            res.json({ name: 'Yahoo Mail MCP Server' });
         });
 
         app.listen(port, () => {

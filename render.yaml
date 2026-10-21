@@ -7,7 +7,7 @@ services:
     name: yahoo-mail-mcp-server
     runtime: docker
     plan: free  # Change to 'starter' or higher for production use
-    region: oregon  # Choose: oregon, frankfurt, singapore, ohio
+    region: frankfurt  # Choose: oregon, frankfurt, singapore, ohio
 
     # Build configuration
     dockerfilePath: ./Dockerfile
@@ -27,6 +27,11 @@ services:
       - key: YAHOO_EMAIL
         sync: false  # Set this in Render Dashboard (Settings > Environment)
       - key: YAHOO_APP_PASSWORD
+        sync: false  # Set this in Render Dashboard (Settings > Environment)
+      # The server refuses to start in SSE mode without these two (openssl rand -hex 16 / -hex 32)
+      - key: OAUTH_CLIENT_ID
+        sync: false  # Set this in Render Dashboard (Settings > Environment)
+      - key: OAUTH_CLIENT_SECRET
         sync: false  # Set this in Render Dashboard (Settings > Environment)
 
     # Health check configuration
