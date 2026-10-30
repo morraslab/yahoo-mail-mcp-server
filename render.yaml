@@ -33,6 +33,13 @@ services:
         sync: false  # Set this in Render Dashboard (Settings > Environment)
       - key: OAUTH_CLIENT_SECRET
         sync: false  # Set this in Render Dashboard (Settings > Environment)
+      # Optional: only for the save_attachments_to_drive tool (see README)
+      - key: GOOGLE_CLIENT_ID
+        sync: false  # Set this in Render Dashboard (Settings > Environment)
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false  # Set this in Render Dashboard (Settings > Environment)
+      - key: GOOGLE_REFRESH_TOKEN
+        sync: false  # Set this in Render Dashboard (Settings > Environment)
 
     # Health check configuration
     healthCheckPath: /health

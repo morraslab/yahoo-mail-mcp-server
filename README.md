@@ -479,6 +479,9 @@ docker ps
 | `OAUTH_CLIENT_ID` | Yes (Remote) | - | OAuth 2.0 client ID for MCP server authentication (generate with `openssl rand -hex 16`) |
 | `OAUTH_CLIENT_SECRET` | Yes (Remote) | - | OAuth 2.0 client secret for MCP server authentication (generate with `openssl rand -hex 32`) |
 | `OAUTH_ALLOWED_REDIRECT_URIS` | No | Claude's callbacks | Comma-separated exact redirect URIs allowed to receive authorization codes. Defaults to `https://claude.ai/api/mcp/auth_callback` and `https://claude.com/api/mcp/auth_callback` |
+| `GOOGLE_CLIENT_ID` | No | - | Google OAuth client ID, only needed for `save_attachments_to_drive` |
+| `GOOGLE_CLIENT_SECRET` | No | - | Google OAuth client secret, only needed for `save_attachments_to_drive` |
+| `GOOGLE_REFRESH_TOKEN` | No | - | Google OAuth refresh token (scope `drive.file`), only needed for `save_attachments_to_drive` |
 | `TRANSPORT_MODE` | No | `stdio` | Transport mode: `stdio` or `sse` |
 | `PORT` | No | `3000` | Port for SSE mode (auto-set by Render) |
 | `NODE_ENV` | No | `development` | Environment: `development` or `production` |
@@ -810,6 +813,37 @@ get_attachment({ uid: 394887, index: 0 })
 // 3. Continue a long document
 get_attachment({ uid: 394887, index: 0, offset: 20000 })
 ```
+
+### save_attachments_to_drive
+
+Upload the PDF attachments of up to 10 emails straight from Yahoo Mail to Google Drive. The file bytes go from this server to Google and never pass through the chat, so it works for large batches (for example, years of monthly statements).
+
+**Parameters:**
+- `uids` (required): UIDs of the emails (at most 10 per call)
+- `folder` (optional): Mail folder containing the emails (default: 'INBOX')
+- `driveFolderName` (optional): Drive folder to save into, created if missing (default: "Yahoo Mail Attachments")
+- `index` (optional): Save only this attachment index. Default: every PDF attachment of each email
+
+**Behaviour:**
+- Attachments named like `29 Oct 2026 CFD Statement.pdf` are saved as `2026-10-29 CFD Statement.pdf` so they sort by date. Other names get the email's date as a prefix
+- Files already in the Drive folder with the same name are skipped, so re-running is safe
+- Attachments over 25 MB are refused
+- The server only uses the `drive.file` scope: it can see and write only the folder and files it created itself, never the rest of your Drive
+
+**Example:**
+```javascript
+save_attachments_to_drive({ uids: [366132, 366124], folder: 'Archive', driveFolderName: 'IG Statements' })
+```
+
+#### Setup: Google Drive credentials
+
+This tool needs a Google OAuth refresh token. (A service account does not work for a personal Google account, because service accounts have no storage quota in My Drive.)
+
+1. In [Google Cloud Console](https://console.cloud.google.com/), create or pick a project and enable the **Google Drive API**.
+2. Under **APIs & Services > OAuth consent screen**, configure the app (External). Add your Google account as a test user. In Testing mode refresh tokens expire after 7 days, which is fine for a one-off job; click "Publish app" for a long-lived token (the `drive.file` scope needs no Google verification).
+3. Under **Credentials**, create an **OAuth client ID** of type *Web application* and add `https://developers.google.com/oauthplayground` as an authorized redirect URI. Note the client ID and secret.
+4. Open the [OAuth 2.0 Playground](https://developers.google.com/oauthplayground), click the gear icon, tick **Use your own OAuth credentials** and enter the client ID and secret. In Step 1 enter the scope `https://www.googleapis.com/auth/drive.file`, authorize, then in Step 2 click **Exchange authorization code for tokens** and copy the **refresh token**.
+5. Set `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` and `GOOGLE_REFRESH_TOKEN` in your environment (on Render: Settings > Environment) and redeploy.
 
 ### search_emails
 
