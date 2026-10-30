@@ -46,6 +46,12 @@ const DEFAULT_ATTACHMENT_CHARS = 20000;
 const MAX_ATTACHMENT_CHARS = 50000;
 const PDF_TIMEOUT_MS = 20000;
 
+// Google Drive upload (save_attachments_to_drive)
+const MAX_DRIVE_BATCH = 10;                        // emails per call, keeps each call well inside client timeouts
+const MAX_DRIVE_FILE_BYTES = 25 * 1024 * 1024;     // refuse to upload a single attachment bigger than this
+const DEFAULT_DRIVE_FOLDER_NAME = 'Yahoo Mail Attachments';
+const MONTH_NUMBERS = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12 };
+
 // Attachment text comes from arbitrary senders. Every result carries this label so the
 // client treats it as data and not as instructions.
 const UNTRUSTED_NOTICE =
@@ -67,6 +73,26 @@ const formatBytes = (n) => {
     if (n < 1024) return `${n} B`;
     if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
     return `${(n / 1024 / 1024).toFixed(1)} MB`;
+};
+
+/** Make an untrusted filename safe to use as a Drive file name. */
+const safeFileName = (name) =>
+    String(name || 'attachment').replace(/[\u0000-\u001f\u007f\\/]/g, '_').replace(/\s+/g, ' ').trim().slice(0, 150) || 'attachment';
+
+/**
+ * Build a sortable Drive file name. Attachments named like "29 Oct 2026 CFD Statement.pdf"
+ * become "2026-10-29 CFD Statement.pdf"; anything else gets the email's date as a prefix.
+ */
+const driveFileName = (filename, emailDate) => {
+    const name = safeFileName(filename);
+    const m = /^(\d{1,2})\s+([A-Za-z]{3})[A-Za-z]*\s+(\d{4})\s*[-_]?\s*(.*)$/.exec(name);
+    const month = m ? MONTH_NUMBERS[m[2].toLowerCase()] : undefined;
+    if (m && month) {
+        const iso = `${m[3]}-${String(month).padStart(2, '0')}-${String(Number(m[1])).padStart(2, '0')}`;
+        return `${iso} ${m[4] || 'attachment'}`.trim();
+    }
+    const d = emailDate instanceof Date && !Number.isNaN(emailDate.getTime()) ? emailDate.toISOString().slice(0, 10) : 'undated';
+    return `${d} ${name}`;
 };
 
 /** Generate an unguessable URL-safe random string. */
@@ -407,6 +433,35 @@ class YahooMailMCPServer {
                         }
                     },
                     {
+                        name: 'save_attachments_to_drive',
+                        description: `Upload the attachments of up to ${MAX_DRIVE_BATCH} emails straight from Yahoo Mail to Google Drive, without the file contents passing through the chat. Files go into a Drive folder that this server creates (and reuses) in the user's My Drive. Files already present in that folder with the same name are skipped, so it is safe to re-run. Requires GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN to be set on the server. Attachments named like "29 Oct 2026 CFD Statement.pdf" are saved as "2026-10-29 CFD Statement.pdf".`,
+                        inputSchema: {
+                            type: 'object',
+                            properties: {
+                                uids: {
+                                    type: 'array',
+                                    items: { type: 'number' },
+                                    description: `UIDs of the emails whose attachments to save (from list_emails or search_emails), at most ${MAX_DRIVE_BATCH} per call`
+                                },
+                                folder: {
+                                    type: 'string',
+                                    description: 'Mail folder containing those emails (default: INBOX)',
+                                    default: 'INBOX'
+                                },
+                                driveFolderName: {
+                                    type: 'string',
+                                    description: `Name of the Drive folder to save into; created if missing (default: "${DEFAULT_DRIVE_FOLDER_NAME}")`,
+                                    default: DEFAULT_DRIVE_FOLDER_NAME
+                                },
+                                index: {
+                                    type: 'number',
+                                    description: 'Only save this attachment index (as shown by read_email). Default: every PDF attachment of each email.'
+                                }
+                            },
+                            required: ['uids']
+                        }
+                    },
+                    {
                         name: 'list_folders',
                         description: 'List all available IMAP folders/mailboxes in your Yahoo Mail account',
                         inputSchema: {
@@ -432,6 +487,9 @@ class YahooMailMCPServer {
 
                     case 'get_attachment':
                         return await this.getAttachment(args?.uid, args?.index, args?.folder || 'INBOX', args?.maxChars, args?.offset);
+
+                    case 'save_attachments_to_drive':
+                        return await this.saveAttachmentsToDrive(args?.uids, args?.folder || 'INBOX', args?.driveFolderName, args?.index);
 
                     case 'search_emails':
                         return await this.searchEmails(args?.query || '', {
@@ -1334,6 +1392,162 @@ class YahooMailMCPServer {
                 text: header + `[File type "${type}" is not supported. Supported: text files, PDFs with a text layer, PNG/JPEG/GIF/WebP images and attached emails. Save the file and upload it to the chat to have it read.]`
             }]
         };
+    }
+
+    /**
+     * Get a short-lived Google access token from the configured OAuth refresh token.
+     * The token is cached in memory until shortly before it expires.
+     */
+    async getDriveAccessToken() {
+        const { GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN } = process.env;
+        if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !GOOGLE_REFRESH_TOKEN) {
+            throw new Error('Google Drive is not configured on this server. Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN (see README, "Setup: Google Drive credentials").');
+        }
+        if (this.driveToken && this.driveToken.expiresAt > Date.now() + 60_000) {
+            return this.driveToken.value;
+        }
+        const res = await fetch('https://oauth2.googleapis.com/token', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({
+                client_id: GOOGLE_CLIENT_ID,
+                client_secret: GOOGLE_CLIENT_SECRET,
+                refresh_token: GOOGLE_REFRESH_TOKEN,
+                grant_type: 'refresh_token'
+            })
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !data.access_token) {
+            throw new Error(`Google refused the refresh token (${res.status} ${data.error || ''} ${data.error_description || ''}). Create a new refresh token and update GOOGLE_REFRESH_TOKEN.`.replace(/\s+/g, ' ').trim());
+        }
+        this.driveToken = { value: data.access_token, expiresAt: Date.now() + (Number(data.expires_in) || 3600) * 1000 };
+        return this.driveToken.value;
+    }
+
+    /** Call the Google Drive API and return parsed JSON, throwing a readable error on failure. */
+    async driveRequest(url, options = {}) {
+        const token = await this.getDriveAccessToken();
+        const res = await fetch(url, { ...options, headers: { ...(options.headers || {}), Authorization: `Bearer ${token}` } });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+            throw new Error(`Google Drive API ${res.status}: ${data?.error?.message || res.statusText}`);
+        }
+        return data;
+    }
+
+    /** Escape a value for use inside a single-quoted Drive query string. */
+    driveQueryValue(value) {
+        return String(value).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+    }
+
+    /**
+     * Find (or create) the Drive folder to save into. With the drive.file scope this
+     * server only sees folders it created itself, so the lookup is by name among those.
+     */
+    async findOrCreateDriveFolder(name) {
+        const q = `name = '${this.driveQueryValue(name)}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`;
+        const found = await this.driveRequest(`https://www.googleapis.com/drive/v3/files?${new URLSearchParams({ q, fields: 'files(id,name)', pageSize: '1' })}`);
+        if (found.files?.length) return found.files[0].id;
+        const created = await this.driveRequest('https://www.googleapis.com/drive/v3/files?fields=id', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name, mimeType: 'application/vnd.google-apps.folder' })
+        });
+        return created.id;
+    }
+
+    /**
+     * Upload the attachments of the given emails to Google Drive. File bytes go straight
+     * from Yahoo to Drive and never pass through the MCP client.
+     */
+    async saveAttachmentsToDrive(uids, folder = 'INBOX', driveFolderName, index) {
+        const fail = (message) => ({ content: [{ type: 'text', text: `Error: ${message}` }] });
+
+        if (!Array.isArray(uids) || uids.length === 0 || !uids.every(u => Number.isInteger(u) && u > 0)) {
+            return fail('uids must be a non-empty array of positive integers');
+        }
+        if (uids.length > MAX_DRIVE_BATCH) {
+            return fail(`Too many emails in one call (${uids.length}). Send at most ${MAX_DRIVE_BATCH} UIDs per call.`);
+        }
+        if (index !== undefined && index !== null && (!Number.isInteger(index) || index < 0)) {
+            return fail('index must be a non-negative integer');
+        }
+
+        const folderName = safeFileName(driveFolderName || DEFAULT_DRIVE_FOLDER_NAME);
+
+        let driveFolderId;
+        try {
+            driveFolderId = await this.findOrCreateDriveFolder(folderName);
+        } catch (err) {
+            return fail(err.message);
+        }
+
+        const lines = [];
+        let uploaded = 0, skipped = 0, failed = 0;
+
+        for (const uid of uids) {
+            try {
+                const raw = await this.fetchRawMessage(uid, folder);
+                const parsed = await simpleParser(raw);
+                const attachments = parsed.attachments || [];
+
+                const wanted = attachments
+                    .map((att, i) => ({ att, i }))
+                    .filter(({ att, i }) => {
+                        if (index !== undefined && index !== null) return i === index;
+                        const type = String(att.contentType || '').toLowerCase().split(';')[0].trim();
+                        const ext = (String(att.filename || '').split('.').pop() || '').toLowerCase();
+                        return type === 'application/pdf' || (type === 'application/octet-stream' && ext === 'pdf');
+                    });
+
+                if (wanted.length === 0) {
+                    failed++;
+                    lines.push(`UID ${uid}: no matching attachment (${attachments.length} attachment(s) in the email)`);
+                    continue;
+                }
+
+                for (const { att, i } of wanted) {
+                    const name = driveFileName(att.filename, parsed.date);
+                    const content = att.content;
+
+                    if (content.length > MAX_DRIVE_FILE_BYTES) {
+                        failed++;
+                        lines.push(`UID ${uid} [${i}]: "${name}" is ${formatBytes(content.length)}, over the ${formatBytes(MAX_DRIVE_FILE_BYTES)} limit`);
+                        continue;
+                    }
+
+                    const q = `name = '${this.driveQueryValue(name)}' and '${driveFolderId}' in parents and trashed = false`;
+                    const existing = await this.driveRequest(`https://www.googleapis.com/drive/v3/files?${new URLSearchParams({ q, fields: 'files(id)', pageSize: '1' })}`);
+                    if (existing.files?.length) {
+                        skipped++;
+                        lines.push(`UID ${uid} [${i}]: skipped, "${name}" already in Drive`);
+                        continue;
+                    }
+
+                    const type = String(att.contentType || 'application/pdf').toLowerCase().split(';')[0].trim();
+                    const boundary = `ymcp_${randomToken(12)}`;
+                    const meta = JSON.stringify({ name, parents: [driveFolderId] });
+                    const body = Buffer.concat([
+                        Buffer.from(`--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${meta}\r\n--${boundary}\r\nContent-Type: ${type}\r\n\r\n`),
+                        content,
+                        Buffer.from(`\r\n--${boundary}--`)
+                    ]);
+                    const file = await this.driveRequest('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,size', {
+                        method: 'POST',
+                        headers: { 'Content-Type': `multipart/related; boundary=${boundary}` },
+                        body
+                    });
+                    uploaded++;
+                    lines.push(`UID ${uid} [${i}]: uploaded "${file.name}" (${formatBytes(Number(file.size) || content.length)}), Drive id ${file.id}`);
+                }
+            } catch (err) {
+                failed++;
+                lines.push(`UID ${uid}: failed, ${err.message}`);
+            }
+        }
+
+        const summary = `Drive folder "${folderName}" (id ${driveFolderId}): ${uploaded} uploaded, ${skipped} skipped, ${failed} failed`;
+        return { content: [{ type: 'text', text: `${summary}\n\n${lines.join('\n')}` }] };
     }
 
     /**
